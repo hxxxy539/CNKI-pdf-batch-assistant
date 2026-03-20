@@ -1,0 +1,40 @@
+{
+  "name": "CNKI助手",
+  "version": "1.0.1",
+  "manifest_version": 3,
+  "description": "知网文献、硕博论文 PDF 批量下载助手",
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "permissions": [
+    "storage",
+    "downloads",
+    "activeTab",
+    "scripting",
+    "sidePanel"
+  ],
+  "host_permissions": ["*://*/*"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "side_panel": {
+    "default_path": "sidepanel/index.html"
+  },
+  "content_scripts": [
+    {
+      "matches": ["*://*/*"],
+      "js": ["content/main.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_title": "CNKI助手",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  }
+}

@@ -1,0 +1,243 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="stylesheet" href="index.css" />
+    <title>CNKI助手</title>
+  </head>
+  <body>
+    <div class="app">
+      <!-- Nav -->
+      <nav class="nav">
+        <button class="nav-item active" data-feature="download">
+          <svg
+            width="15"
+            height="15"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          >
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+            <polyline points="7 10 12 15 17 10" />
+            <line x1="12" y1="15" x2="12" y2="3" />
+          </svg>
+          批量下载
+        </button>
+        <button class="nav-item" disabled>
+          <svg
+            width="15"
+            height="15"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          >
+            <circle cx="12" cy="12" r="10" />
+            <line x1="12" y1="8" x2="12" y2="16" />
+            <line x1="8" y1="12" x2="16" y2="12" />
+          </svg>
+          更多功能
+        </button>
+      </nav>
+
+      <!-- Feature: Download -->
+      <div class="feature" id="feature-download">
+        <!-- Controls -->
+        <div class="controls">
+          <div class="controls-btns">
+            <button class="btn btn-accent" id="btn-add-page">
+              <svg
+                width="13"
+                height="13"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2.2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              >
+                <line x1="12" y1="5" x2="12" y2="19" />
+                <line x1="5" y1="12" x2="19" y2="12" />
+              </svg>
+              添加本页
+            </button>
+            <button class="btn btn-accent" id="btn-fetch-links">
+              <svg
+                width="13"
+                height="13"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              >
+                <path
+                  d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"
+                />
+                <path
+                  d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"
+                />
+              </svg>
+              获取链接
+            </button>
+            <button class="btn btn-accent" id="btn-refresh-links">
+              <svg
+                width="13"
+                height="13"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              >
+                <polyline points="23 4 23 10 17 10" />
+                <polyline points="1 20 1 14 7 14" />
+                <path d="M3.51 9a9 9 0 0 1 14.13-3.36L23 10" />
+                <path d="M20.49 15a9 9 0 0 1-14.13 3.36L1 14" />
+              </svg>
+              重新获取链接
+            </button>
+          </div>
+          <div class="controls-toggles">
+            <label class="toggle" title="通过 WebVPN 访问知网时开启">
+              <input type="checkbox" id="toggle-webvpn" />
+              <span class="toggle-switch"></span>
+              <span class="toggle-text">WebVPN</span>
+            </label>
+            <label class="toggle" title="异步加载期刊等级信息">
+              <input type="checkbox" id="toggle-levels" checked />
+              <span class="toggle-switch"></span>
+              <span class="toggle-text">等级</span>
+            </label>
+          </div>
+        </div>
+
+        <!-- Progress -->
+        <div class="progress" id="progress" hidden>
+          <div class="progress-bar">
+            <div class="progress-fill" id="progress-fill"></div>
+          </div>
+          <span class="progress-text" id="progress-text">获取中...</span>
+        </div>
+
+        <!-- List header -->
+        <div class="list-header" id="list-header" hidden>
+          <div class="list-header-left">
+            <label class="check">
+              <input type="checkbox" id="select-all" />
+              <span class="check-box"></span>
+            </label>
+            <span class="list-count" id="list-count">0 条</span>
+            <div class="sort-pills">
+              <button class="sort-pill active" data-sort="">默认</button>
+              <button class="sort-pill" data-sort="date">时间</button>
+              <button class="sort-pill" data-sort="quote">被引</button>
+              <button class="sort-pill" data-sort="download">下载</button>
+            </div>
+          </div>
+          <div class="list-header-right">
+            <button class="btn btn-ghost btn-sm" id="btn-clear">清空</button>
+            <button class="btn btn-accent btn-sm" id="btn-batch-dl">
+              下载 <span id="dl-count"></span>
+            </button>
+          </div>
+        </div>
+
+        <!-- Paper list -->
+        <div class="paper-list" id="paper-list"></div>
+
+        <!-- Log Panel -->
+        <div class="log-panel" id="log-panel" hidden>
+          <div class="log-panel-header">
+            <span class="log-panel-title">
+              <svg
+                width="13"
+                height="13"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              >
+                <path
+                  d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"
+                />
+                <polyline points="14 2 14 8 20 8" />
+              </svg>
+              日志
+              <span class="log-badge" id="log-badge">0</span>
+            </span>
+            <div class="log-panel-actions">
+              <button
+                class="btn btn-ghost btn-sm"
+                id="log-copy-all"
+                title="复制全部日志"
+              >
+                复制
+              </button>
+              <button
+                class="btn btn-ghost btn-sm"
+                id="log-clear"
+                title="清空日志"
+              >
+                清空
+              </button>
+            </div>
+          </div>
+          <div class="log-list" id="log-list"></div>
+        </div>
+      </div>
+
+      <!-- Footer -->
+      <footer class="footer">
+        <span class="footer-status" id="footer-status"></span>
+        <div class="footer-right">
+          <div class="qr-link">
+            <span class="qr-trigger">公众号: zgmgm</span>
+            <div class="qr-popup">
+              <img
+                src="../icons/qrcode.jpg"
+                alt="公众号二维码"
+                width="160"
+                height="160"
+              />
+              <span class="qr-tip">扫码关注</span>
+            </div>
+          </div>
+          <span class="footer-sep">|</span>
+          <button class="log-toggle-btn" id="log-toggle" title="显示/隐藏日志">
+            <svg
+              width="12"
+              height="12"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+            >
+              <path
+                d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"
+              />
+              <polyline points="14 2 14 8 20 8" />
+            </svg>
+            日志
+            <span class="log-badge-mini" id="log-badge-footer" hidden>0</span>
+          </button>
+          <span class="footer-ver">v1.0.1</span>
+        </div>
+      </footer>
+    </div>
+
+    <script src="index.js"></script>
+  </body>
+</html>
