@@ -2,7 +2,12 @@
 
 // ── State ──
 let papers = [];
-let settings = { useWebVPN: false, fetchLevels: true };
+let settings = {
+  useWebVPN: false,
+  fetchLevels: true,
+  loginUsername: "",
+  loginPassword: "",
+};
 let sortField = "";
 let sortDir = "desc";
 const downloadState = {};
@@ -12,7 +17,7 @@ const levelPending = new Map();
 let isBatchDownloading = false;
 let manualRecoveryCleanup = null;
 let reloginRecoveryCleanup = null;
-const MAX_FAIL_RETRIES = 2;
+const MAX_FAIL_RETRIES = 5;
 const paperFailRetryCount = new Map();
 const retryCapLogged = new Set();
 const MAX_CONSECUTIVE_FAIL_STOP = 3;
@@ -61,16 +66,45 @@ async function loadSettings() {
   const data = await chrome.storage.local.get([
     "useWebVPN",
     "fetchLevels",
+    "loginUsername",
+    "loginPassword",
     "cnkiPapers",
     "cnkiSort",
   ]);
   settings.useWebVPN = data.useWebVPN ?? false;
   settings.fetchLevels = data.fetchLevels ?? true;
+  settings.loginUsername = String(data.loginUsername || "").trim();
+  settings.loginPassword = String(data.loginPassword || "");
   papers = Array.isArray(data.cnkiPapers) ? data.cnkiPapers : [];
   if (data.cnkiSort) {
     sortField = data.cnkiSort.field || "";
     sortDir = data.cnkiSort.dir || "desc";
   }
+}
+
+async function saveLoginCredentials(username, password) {
+  settings.loginUsername = String(username || "").trim();
+  settings.loginPassword = String(password || "");
+  await chrome.storage.local.set({
+    loginUsername: settings.loginUsername,
+    loginPassword: settings.loginPassword,
+  });
+}
+
+function applyLoginFormState(saved) {
+  const usernameInput = $("#login-username");
+  const passwordInput = $("#login-password");
+  const saveBtn = $("#btn-save-login");
+  const clearBtn = $("#btn-clear-login");
+
+  if (!usernameInput || !passwordInput || !saveBtn || !clearBtn) return;
+
+  usernameInput.disabled = saved;
+  passwordInput.disabled = saved;
+  saveBtn.disabled = saved;
+  saveBtn.classList.toggle("btn-success", saved);
+  saveBtn.textContent = saved ? "提交成功" : "提交";
+  clearBtn.disabled = !saved;
 }
 
 async function savePapers() {
@@ -206,6 +240,25 @@ function normalizeUrlKey(url) {
     .replace(/#.*$/, "");
 }
 
+async function registerDownloadMetaForPaper(paper) {
+  if (!paper?.pdfLink) return false;
+  const year = extractYearFromDate(paper.date);
+  if (!year) return false;
+
+  try {
+    const res = await sendToBackground({
+      type: "REGISTER_DOWNLOAD_META",
+      url: paper.pdfLink,
+      aliases: [paper.detailUrl],
+      year,
+      journal: paper.source || "unknown_journal",
+    });
+    return !!res?.ok;
+  } catch {
+    return false;
+  }
+}
+
 function extractOrderId(url) {
   try {
     const u = new URL(url);
@@ -225,7 +278,11 @@ async function removePaperById(id) {
   updateFooter();
 }
 
-function waitManualRecoveryCompletion({ paper, timeoutMs = 15 * 60 * 1000 }) {
+function waitManualRecoveryCompletion({
+  paper,
+  recoveryTabId = null,
+  timeoutMs = 15 * 60 * 1000,
+}) {
   if (!paper?.id || !paper?.pdfLink) {
     return Promise.resolve({ ok: false, reason: "invalid_paper" });
   }
@@ -265,6 +322,9 @@ function waitManualRecoveryCompletion({ paper, timeoutMs = 15 * 60 * 1000 }) {
 
     const finish = (result) => {
       cleanup();
+      if (result?.ok && recoveryTabId != null) {
+        chrome.tabs.remove(recoveryTabId).catch(() => {});
+      }
       resolve(result);
     };
 
@@ -291,8 +351,28 @@ function waitManualRecoveryCompletion({ paper, timeoutMs = 15 * 60 * 1000 }) {
       finish({ ok: false, reason: "manual_verify_timeout" });
     }, timeoutMs);
 
+    const reloginWatch =
+      recoveryTabId == null
+        ? null
+        : setInterval(async () => {
+            try {
+              const pageInfo = await inspectTabPageType(recoveryTabId);
+              if (pageInfo?.pageType === "relogin") {
+                finish({
+                  ok: false,
+                  reason: "manual_verify_relogin",
+                  tabId: recoveryTabId,
+                  pageUrl: pageInfo?.url || "",
+                });
+              }
+            } catch {
+              // Ignore transient tab inspection errors.
+            }
+          }, 500);
+
     const cleanup = () => {
       clearTimeout(timer);
+      if (reloginWatch) clearInterval(reloginWatch);
       chrome.downloads.onCreated.removeListener(onCreate);
       chrome.downloads.onChanged.removeListener(onChange);
       if (manualRecoveryCleanup === cleanup) manualRecoveryCleanup = null;
@@ -320,53 +400,394 @@ function resumeFromPaper(paperId, statusText) {
       return;
     }
     if (left <= 0) return;
-    setTimeout(() => tryResume(left - 1), 300);
+    setTimeout(() => tryResume(left - 1), 200);
   };
   tryResume();
 }
 
-async function attemptAutoLogoutAndOpenLogin(tabId) {
-  if (!tabId) return;
-  await bringTabToFront(tabId);
+async function attemptAutoLogoutAndOpenLogin({ blockedTabId, preferredUrl }) {
+  let closedBlockedTab = false;
+
+  if (blockedTabId) {
+    try {
+      await chrome.tabs.remove(blockedTabId);
+      closedBlockedTab = true;
+    } catch {
+      // Ignore close failure and continue.
+    }
+  }
+
+  let targetTab = null;
+  try {
+    const cnkiTabs = await chrome.tabs.query({ url: ["*://*.cnki.net/*"] });
+    const candidates = cnkiTabs.filter(
+      (t) => t?.id && t.id !== blockedTabId && (t.url || "").startsWith("http"),
+    );
+
+    targetTab =
+      candidates.find((t) => t.active) ||
+      candidates.find((t) => /kns\.cnki\.net/i.test(t.url || "")) ||
+      candidates[0] ||
+      null;
+  } catch {
+    // Ignore query failures.
+  }
+
+  if (!targetTab && preferredUrl) {
+    try {
+      const created = await chrome.tabs.create({
+        url: preferredUrl,
+        active: true,
+      });
+      if (created?.id) targetTab = created;
+    } catch {
+      // Ignore create failures.
+    }
+  }
+
+  if (!targetTab?.id) {
+    return {
+      ok: false,
+      reason: "target_cnki_tab_not_found",
+      closedBlockedTab,
+    };
+  }
+
+  await bringTabToFront(targetTab.id, targetTab.windowId);
 
   try {
-    await chrome.scripting.executeScript({
-      target: { tabId },
+    const [execResult] = await chrome.scripting.executeScript({
+      target: { tabId: targetTab.id },
       world: "MAIN",
-      func: () => {
+      func: async () => {
+        const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
         const textOf = (el) => (el?.innerText || el?.textContent || "").trim();
-
-        const clickByText = (selector, re) => {
-          const els = Array.from(document.querySelectorAll(selector));
-          const hit = els.find((el) => re.test(textOf(el)));
-          if (hit) {
-            hit.click();
+        const isVisible = (el) => {
+          if (!el) return false;
+          const style = window.getComputedStyle(el);
+          return (
+            style.display !== "none" &&
+            style.visibility !== "hidden" &&
+            style.opacity !== "0"
+          );
+        };
+        const hardClick = (el) => {
+          if (!el) return false;
+          try {
+            el.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+            el.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+            el.click();
             return true;
+          } catch {
+            return false;
           }
-          return false;
         };
 
-        const navByHref = (re) => {
-          const links = Array.from(document.querySelectorAll("a[href]"));
-          const hit = links.find((a) => re.test(a.getAttribute("href") || ""));
-          if (hit) {
-            location.assign(hit.href);
-            return true;
+        const logoutRegex = /退出|注销|登出|logout|sign\s*out/i;
+
+        // Open personal/unit menu first to expose logout entry.
+        const menuTriggers = [
+          ".ecp_header_personalName_loginbg",
+          ".ecp_header_personalName",
+          ".ecp_header_unitName",
+          ".ecp_header_unit_loginIcon",
+          ".ecp_header_login_status",
+        ];
+        for (const sel of menuTriggers) {
+          const el = document.querySelector(sel);
+          if (el && isVisible(el)) {
+            hardClick(el);
+            await sleep(120);
           }
-          return false;
-        };
+        }
 
-        // 1) Try logout first.
-        if (clickByText("a,button", /退出|注销|登出|logout|sign\s*out/i))
-          return;
-        if (navByHref(/logout|signout|sign-out|exit|\/out\b/i)) return;
+        // Prefer explicit logout nodes from CNKI header.
+        const directSelectors = [
+          ".Ecp_members_logout",
+          ".ecp_mycnki_logout",
+          ".ecp_unit_userlogout",
+          "li[onclick*='Ecp_loginOut_showState']",
+        ];
+        for (const sel of directSelectors) {
+          const el = document.querySelector(sel);
+          if (el && isVisible(el) && hardClick(el)) {
+            return { ok: true, mode: "selector", selector: sel };
+          }
+        }
 
-        // 2) Then try open login entry.
-        if (clickByText("a,button", /登录|登\s*录|login|sign\s*in/i)) return;
-        navByHref(/login|signin|sign-in/i);
+        // Try calling CNKI logout method directly if available.
+        try {
+          if (typeof window.Ecp_loginOut_showState === "function") {
+            window.Ecp_loginOut_showState(2);
+            await sleep(80);
+            return {
+              ok: true,
+              mode: "function",
+              fn: "Ecp_loginOut_showState(2)",
+            };
+          }
+        } catch {
+          // Ignore.
+        }
+
+        const clickable = Array.from(
+          document.querySelectorAll("a,button,li,span,div"),
+        );
+        const logoutHit = clickable.find((el) => {
+          const txt = textOf(el);
+          if (!txt || !logoutRegex.test(txt)) return false;
+          return isVisible(el);
+        });
+        if (logoutHit && hardClick(logoutHit)) {
+          return { ok: true, mode: "text" };
+        }
+
+        const hrefHit = Array.from(document.querySelectorAll("a[href]")).find(
+          (a) =>
+            /logout|signout|sign-out|\/out\b/i.test(
+              a.getAttribute("href") || "",
+            ),
+        );
+        if (hrefHit) {
+          location.assign(hrefHit.href);
+          return { ok: true, mode: "href" };
+        }
+
+        return { ok: false, reason: "logout_entry_not_found" };
       },
     });
-  } catch {}
+
+    const logoutOk = !!execResult?.result?.ok;
+    const logoutReason = execResult?.result?.reason || "";
+    let loginPrepared = false;
+    let loginPrepareReason = "";
+
+    if (logoutOk && (settings.loginUsername || settings.loginPassword)) {
+      const prep = await autoPrepareLoginCredentials(targetTab.id, {
+        username: settings.loginUsername,
+        password: settings.loginPassword,
+      });
+      loginPrepared = !!prep?.ok;
+      loginPrepareReason = prep?.reason || "";
+    }
+
+    // Fallback: even if logout button is not detectable on current page,
+    // navigate to CNKI page and still try auto-login to avoid getting stuck.
+    if (!logoutOk && (settings.loginUsername || settings.loginPassword)) {
+      const loginUrl = preferredUrl || "https://kns.cnki.net/";
+      try {
+        await chrome.tabs.update(targetTab.id, { url: loginUrl, active: true });
+      } catch {
+        // Ignore update errors and still attempt login on current tab.
+      }
+      await waitForTabComplete(targetTab.id, 20000);
+
+      const fallbackPrep = await autoPrepareLoginCredentials(targetTab.id, {
+        username: settings.loginUsername,
+        password: settings.loginPassword,
+      });
+      loginPrepared = !!fallbackPrep?.ok;
+      loginPrepareReason = fallbackPrep?.reason || "";
+
+      if (loginPrepared) {
+        return {
+          ok: true,
+          reason: logoutReason || "logout_entry_not_found",
+          mode: "fallback_login",
+          closedBlockedTab,
+          targetTabId: targetTab.id,
+          loginPrepared,
+          loginPrepareReason,
+        };
+      }
+    }
+
+    return {
+      ok: !!execResult?.result?.ok,
+      reason:
+        !logoutOk && loginPrepareReason
+          ? `${logoutReason || "logout_failed"};${loginPrepareReason}`
+          : logoutReason,
+      mode: execResult?.result?.mode || "",
+      closedBlockedTab,
+      targetTabId: targetTab.id,
+      loginPrepared,
+      loginPrepareReason,
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      reason: err?.message || "script_failed",
+      closedBlockedTab,
+      targetTabId: targetTab.id,
+      loginPrepared: false,
+      loginPrepareReason: "",
+    };
+  }
+}
+
+async function autoPrepareLoginCredentials(
+  tabId,
+  { username = "", password = "" } = {},
+  timeoutMs = 10000,
+) {
+  if (!tabId || (!username && !password)) {
+    return { ok: false, reason: "invalid_params" };
+  }
+
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const [res] = await chrome.scripting.executeScript({
+        target: { tabId },
+        world: "MAIN",
+        func: (u, p) => {
+          const textOf = (el) =>
+            (el?.innerText || el?.textContent || "").trim();
+          const isVisible = (el) => {
+            if (!el) return false;
+            const style = window.getComputedStyle(el);
+            return (
+              style.display !== "none" &&
+              style.visibility !== "hidden" &&
+              style.opacity !== "0"
+            );
+          };
+          const hardClick = (el) => {
+            if (!el) return false;
+            try {
+              el.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+              el.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+              el.click();
+              return true;
+            } catch {
+              return false;
+            }
+          };
+
+          const personalTriggers = [
+            ".ecp_header_personal_loginbg",
+            ".ecp_header_personalName_loginbg",
+            ".ecp_header_login_status",
+            "[onclick*='showPersonalLogin']",
+          ];
+          for (const sel of personalTriggers) {
+            const el = document.querySelector(sel);
+            if (el && isVisible(el)) {
+              hardClick(el);
+            }
+          }
+
+          const inputs = [
+            ".ecp_personalLoginBox .ecp_userName",
+            "input.ecp_userName",
+          ];
+          const pwdInputs = [
+            ".ecp_personalLoginBox .ecp_passWord",
+            "input.ecp_passWord",
+          ];
+
+          let userInput = null;
+          for (const sel of inputs) {
+            const el = document.querySelector(sel);
+            if (el) {
+              userInput = el;
+              break;
+            }
+          }
+
+          let pwdInput = null;
+          for (const sel of pwdInputs) {
+            const el = document.querySelector(sel);
+            if (el) {
+              pwdInput = el;
+              break;
+            }
+          }
+
+          if (u && (!userInput || !isVisible(userInput))) {
+            const maybeLoggedOut = textOf(document.body).includes("个人登录");
+            return {
+              ok: false,
+              reason: maybeLoggedOut
+                ? "personal_username_input_hidden"
+                : "personal_username_input_not_found",
+            };
+          }
+
+          if (p && (!pwdInput || !isVisible(pwdInput))) {
+            return {
+              ok: false,
+              reason: "personal_password_input_not_found",
+            };
+          }
+
+          if (u && userInput) {
+            userInput.focus();
+            userInput.value = u;
+            userInput.dispatchEvent(new Event("input", { bubbles: true }));
+            userInput.dispatchEvent(new Event("change", { bubbles: true }));
+          }
+
+          if (p && pwdInput) {
+            pwdInput.focus();
+            pwdInput.value = p;
+            pwdInput.dispatchEvent(new Event("input", { bubbles: true }));
+            pwdInput.dispatchEvent(new Event("change", { bubbles: true }));
+          }
+
+          // Ensure CNKI agreement/privacy checkbox is checked.
+          const agreeSelectors = [
+            "#agreement",
+            "#agreementSms",
+            "#agreementUnit",
+            "input.ecp-account-login#agreement",
+            "input.ecp-sms-login#agreementSms",
+          ];
+          for (const sel of agreeSelectors) {
+            const cb = document.querySelector(sel);
+            if (!cb || cb.disabled) continue;
+            if (!cb.checked) {
+              cb.checked = true;
+              cb.dispatchEvent(new Event("input", { bubbles: true }));
+              cb.dispatchEvent(new Event("change", { bubbles: true }));
+            }
+          }
+
+          // Auto-click login button after filling credentials and agreements.
+          const loginBtnSelectors = [
+            "button.ECP_UserLOgin.ecp-account-login",
+            "button.ECP_UserLOgin.ecp-sms-login",
+            "button.ECP_UnitLOgin",
+          ];
+          let clickedLogin = false;
+          for (const sel of loginBtnSelectors) {
+            const btn = document.querySelector(sel);
+            if (!btn || !isVisible(btn) || btn.disabled) continue;
+            if (hardClick(btn)) {
+              clickedLogin = true;
+              break;
+            }
+          }
+
+          if (!clickedLogin) {
+            return { ok: false, reason: "login_button_not_found" };
+          }
+
+          return { ok: true };
+        },
+        args: [username, password],
+      });
+
+      if (res?.result?.ok) return { ok: true };
+    } catch {
+      // Ignore transient tab/script errors and retry.
+    }
+
+    await new Promise((r) => setTimeout(r, 500));
+  }
+
+  return { ok: false, reason: "login_input_not_ready" };
 }
 
 function startReloginRecoveryWatch({ paper }) {
@@ -379,7 +800,7 @@ function startReloginRecoveryWatch({ paper }) {
 
   const startedAt = Date.now();
 
-  const timer = setInterval(async () => {
+  const checkLoginRestored = async () => {
     // Stop watcher after 30 min.
     if (Date.now() - startedAt > 30 * 60 * 1000) {
       cleanup();
@@ -407,11 +828,19 @@ function startReloginRecoveryWatch({ paper }) {
       ) {
         cleanup();
         resumeFromPaper(paper.id, "检测到你已重新登录，从当前论文恢复下载");
+        return;
       }
     } catch {
       // Ignore transient network errors while waiting for user relogin.
     }
-  }, 8000);
+  };
+
+  // Run one immediate check to avoid first-interval delay.
+  void checkLoginRestored();
+
+  const timer = setInterval(() => {
+    void checkLoginRestored();
+  }, 2000);
 
   const cleanup = () => {
     clearInterval(timer);
@@ -480,14 +909,42 @@ function waitForTabComplete(tabId, timeoutMs = 20000) {
   });
 }
 
-async function bringTabToFront(tabId) {
+async function bringTabToFront(tabId, windowId = null) {
   if (!tabId) return;
+
+  // Activate tab first. This usually works even when tabs.get is restricted.
   try {
-    const tab = await chrome.tabs.get(tabId);
-    if (!tab?.id) return;
-    await chrome.tabs.update(tab.id, { active: true });
-    if (typeof tab.windowId === "number") {
-      await chrome.windows.update(tab.windowId, { focused: true });
+    await chrome.tabs.update(tabId, { active: true });
+  } catch {
+    // Ignore and continue trying to focus the window.
+  }
+
+  let targetWindowId =
+    typeof windowId === "number" && Number.isFinite(windowId) ? windowId : null;
+
+  if (targetWindowId == null) {
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      if (typeof tab?.windowId === "number") targetWindowId = tab.windowId;
+    } catch {
+      // Ignore and fall back to current window focus.
+    }
+  }
+
+  try {
+    if (targetWindowId != null) {
+      await chrome.windows.update(targetWindowId, {
+        focused: true,
+        drawAttention: true,
+      });
+      return;
+    }
+    const current = await chrome.windows.getCurrent();
+    if (typeof current?.id === "number") {
+      await chrome.windows.update(current.id, {
+        focused: true,
+        drawAttention: true,
+      });
     }
   } catch {
     // Ignore focus failures and keep normal flow.
@@ -610,9 +1067,12 @@ async function openVerificationPage(paper) {
   const url = paper?.detailUrl || paper?.pdfLink || "";
   if (!url) return;
   try {
+    // Register once more before manual verification flow to reduce metadata miss.
+    await registerDownloadMetaForPaper(paper);
+
     const tab = await chrome.tabs.create({ url, active: true });
     if (!tab?.id) return;
-    await bringTabToFront(tab.id);
+    await bringTabToFront(tab.id, tab.windowId);
 
     await waitForTabComplete(tab.id, 20000);
     const clickResult = await tryClickPdfButtonInTab(tab.id);
@@ -638,15 +1098,21 @@ async function silentRecoverDownload(paper) {
   if (!url) return { ok: false, reason: "no_url" };
 
   let tabId = null;
+  let tabWindowId = null;
   try {
+    // Re-register metadata for recovery download that may use a redirected URL.
+    await registerDownloadMetaForPaper(paper);
+
     const tab = await chrome.tabs.create({ url, active: false });
     tabId = tab?.id || null;
+    tabWindowId =
+      typeof tab?.windowId === "number" ? tab.windowId : tabWindowId;
     if (!tabId) return { ok: false, reason: "tab_create_failed" };
 
-    await waitForTabComplete(tabId, 20000);
+    await waitForTabComplete(tabId, 15000);
     const clickResult = await tryClickPdfButtonInTab(tabId);
     if (!clickResult?.clicked) {
-      await bringTabToFront(tabId);
+      await bringTabToFront(tabId, tabWindowId);
       const pageInfo = await inspectTabPageType(tabId);
       return {
         ok: false,
@@ -657,7 +1123,7 @@ async function silentRecoverDownload(paper) {
       };
     }
 
-    const recoveryResult = await waitForDownload(paper.pdfLink, 15000);
+    const recoveryResult = await waitForDownload(paper.pdfLink, 8000);
     if (recoveryResult === "success") {
       try {
         await chrome.tabs.remove(tabId);
@@ -665,7 +1131,7 @@ async function silentRecoverDownload(paper) {
       return { ok: true };
     }
 
-    await bringTabToFront(tabId);
+    await bringTabToFront(tabId, tabWindowId);
     const pageInfo = await inspectTabPageType(tabId);
     return {
       ok: false,
@@ -676,7 +1142,7 @@ async function silentRecoverDownload(paper) {
     };
   } catch (err) {
     if (tabId) {
-      await bringTabToFront(tabId);
+      await bringTabToFront(tabId, tabWindowId);
     }
     let pageType = "unknown";
     let pageUrl = "";
@@ -877,16 +1343,7 @@ async function downloadPaper(id) {
     const tab = await getActiveTab();
     if (!tab?.id) throw new Error("请在知网页面使用");
 
-    const year = extractYearFromDate(paper.date);
-    if (year) {
-      await sendToBackground({
-        type: "REGISTER_DOWNLOAD_META",
-        url: paper.pdfLink,
-        aliases: [paper.detailUrl],
-        year,
-        journal: paper.source || "unknown_journal",
-      });
-    }
+    await registerDownloadMetaForPaper(paper);
 
     // Trigger download via hidden iframe in page's MAIN world
     // This is a navigation request — sends correct cookies & Referer, no CORS
@@ -908,7 +1365,7 @@ async function downloadPaper(id) {
     });
 
     // Monitor chrome.downloads for the actual download
-    const downloadResult = await waitForDownload(paper.pdfLink, 15000);
+    const downloadResult = await waitForDownload(paper.pdfLink, 10000);
 
     if (downloadResult === "success") {
       setDownloadState(id, "success");
@@ -946,12 +1403,16 @@ async function downloadPaper(id) {
       setDownloadState(id, "error", "下载未启动，可能需要登录或验证");
 
       if (recovered.pageType === "verify") {
+        await registerDownloadMetaForPaper(paper);
         addLog(
           "error",
           `下载未启动: ${paper.title}`,
           `URL: ${paper.pdfLink}\n检测结果: 验证页面\n已为你弹出验证页面，请手动验证。当前批量将等待该篇完成后再继续下一篇。`,
         );
-        const manualRecovered = await waitManualRecoveryCompletion({ paper });
+        const manualRecovered = await waitManualRecoveryCompletion({
+          paper,
+          recoveryTabId: recovered.tabId,
+        });
         if (manualRecovered.ok) {
           setDownloadState(id, "success");
           await removePaperById(id);
@@ -959,6 +1420,41 @@ async function downloadPaper(id) {
           $("#footer-status").textContent =
             "手动验证后已完成该篇下载，继续下一篇";
           return true;
+        }
+
+        if (manualRecovered.reason === "manual_verify_relogin") {
+          if (reloginRecoveryCleanup) {
+            reloginRecoveryCleanup();
+            reloginRecoveryCleanup = null;
+          }
+
+          const autoRelogin = await attemptAutoLogoutAndOpenLogin({
+            blockedTabId: manualRecovered.tabId || recovered.tabId,
+            preferredUrl: paper.detailUrl,
+          });
+
+          if (autoRelogin.ok) {
+            if (autoRelogin.loginPrepared) {
+              startReloginRecoveryWatch({ paper });
+            }
+            $("#footer-status").textContent = autoRelogin.loginPrepared
+              ? "验证后检测到频繁操作，已自动退出并尝试自动登录，登录恢复后将自动重试当前论文"
+              : "验证后检测到频繁操作，已自动关闭异常页并执行退出，但自动登录未完成";
+            addLog(
+              "error",
+              `验证后需重新登录: ${paper.title}`,
+              `URL: ${paper.pdfLink}\n检测结果: 验证后跳转到频繁操作页面\n页面: ${manualRecovered.pageUrl || recovered.pageUrl || "(未知)"}\n已自动关闭异常页面并尝试执行退出。${autoRelogin.loginPrepared ? "已自动填写账号密码、勾选协议并点击登录。登录恢复后会自动重试当前失败论文。" : `自动登录准备失败: ${autoRelogin.loginPrepareReason || "unknown"}`}\n${autoRelogin.loginPrepared ? "" : "请确认登录状态后点击重试。"}`,
+            );
+          } else {
+            $("#footer-status").textContent =
+              "验证后检测到频繁操作需重登，自动退出失败，请手动退出并重新登录后重试";
+            addLog(
+              "error",
+              `验证后需重新登录: ${paper.title}`,
+              `URL: ${paper.pdfLink}\n检测结果: 验证后跳转到频繁操作页面\n页面: ${manualRecovered.pageUrl || recovered.pageUrl || "(未知)"}\n自动处理失败: ${autoRelogin.reason || "unknown"}\n请手动退出并重新登录后点击重试。`,
+            );
+          }
+          return false;
         }
 
         $("#footer-status").textContent =
@@ -980,14 +1476,32 @@ async function downloadPaper(id) {
           reloginRecoveryCleanup();
           reloginRecoveryCleanup = null;
         }
-        $("#footer-status").textContent =
-          "检测到频繁操作需重登，已停止批量下载，请登录后手动重启";
+        const autoRelogin = await attemptAutoLogoutAndOpenLogin({
+          blockedTabId: recovered.tabId,
+          preferredUrl: paper.detailUrl,
+        });
 
-        addLog(
-          "error",
-          `下载未启动: ${paper.title}`,
-          `URL: ${paper.pdfLink}\n检测结果: 频繁操作需重新登录页面\n页面: ${recovered.pageUrl || "(未知)"}\n已停止自动恢复与自动重启，请你手动登录后手动点击批量下载。`,
-        );
+        if (autoRelogin.ok) {
+          if (autoRelogin.loginPrepared) {
+            startReloginRecoveryWatch({ paper });
+          }
+          $("#footer-status").textContent = autoRelogin.loginPrepared
+            ? "检测到频繁操作，已自动退出并尝试自动登录，登录恢复后将自动重试当前论文"
+            : "检测到频繁操作，已自动关闭异常页并执行退出，但自动登录未完成";
+          addLog(
+            "error",
+            `下载未启动: ${paper.title}`,
+            `URL: ${paper.pdfLink}\n检测结果: 频繁操作需重新登录页面\n页面: ${recovered.pageUrl || "(未知)"}\n已自动关闭异常页面并尝试执行退出。${autoRelogin.loginPrepared ? "已自动填写账号密码、勾选协议并点击登录。登录恢复后会自动重试当前失败论文。" : `自动登录准备失败: ${autoRelogin.loginPrepareReason || "unknown"}`}\n${autoRelogin.loginPrepared ? "" : "请确认登录状态后点击重试。"}`,
+          );
+        } else {
+          $("#footer-status").textContent =
+            "检测到频繁操作需重登，自动退出失败，请手动退出并重新登录后重试";
+          addLog(
+            "error",
+            `下载未启动: ${paper.title}`,
+            `URL: ${paper.pdfLink}\n检测结果: 频繁操作需重新登录页面\n页面: ${recovered.pageUrl || "(未知)"}\n自动处理失败: ${autoRelogin.reason || "unknown"}\n请手动退出并重新登录后点击重试。`,
+          );
+        }
         return false;
       }
 
@@ -1090,7 +1604,10 @@ function waitForDownload(expectedUrl, timeoutMs) {
 }
 
 async function downloadSelected(startFromId = null) {
-  if (isBatchDownloading) return;
+  if (isBatchDownloading) {
+    $("#footer-status").textContent = "批量下载进行中，请稍候";
+    return;
+  }
   isBatchDownloading = true;
   let selected = getSelectedIds();
   try {
@@ -1103,7 +1620,10 @@ async function downloadSelected(startFromId = null) {
       }
     }
 
-    if (selected.length === 0) return;
+    if (selected.length === 0) {
+      $("#footer-status").textContent = "请先勾选要下载的论文";
+      return;
+    }
     for (const id of selected) {
       if (downloadState[id]?.status === "success") continue;
       const paper = papers.find((p) => p.id === id);
@@ -1136,6 +1656,7 @@ async function downloadSelected(startFromId = null) {
     }
   } finally {
     isBatchDownloading = false;
+    updateFooter();
   }
 }
 
@@ -1369,6 +1890,16 @@ function updateFooter() {
   $("#footer-status").textContent = parts.join("  ·  ");
   $("#dl-count").textContent = selected > 0 ? `(${selected})` : "";
   $("#list-count").textContent = `${total} 篇`;
+  const batchBtn = $("#btn-batch-dl");
+  if (batchBtn) {
+    batchBtn.disabled = selected === 0 || isBatchDownloading;
+    batchBtn.title =
+      selected === 0
+        ? "请先勾选要下载的论文"
+        : isBatchDownloading
+          ? "批量下载进行中"
+          : "";
+  }
 }
 
 function setProgress(pct, text) {
@@ -1469,7 +2000,7 @@ function bindEvents() {
       const id = parseInt(retry.dataset.id);
       // Manual retry should clear the automatic retry cap for this paper.
       resetFailRetryCount(id);
-      downloadPaper(id);
+      downloadSelected(id);
       return;
     }
 
@@ -1536,6 +2067,27 @@ function bindEvents() {
     if (settings.fetchLevels) loadAllLevels();
   });
 
+  // Login credentials
+  $("#btn-save-login").addEventListener("click", async () => {
+    const username = $("#login-username").value.trim();
+    const password = $("#login-password").value;
+    if (!username || !password) {
+      $("#footer-status").textContent = "请输入用户名和密码后再提交";
+      return;
+    }
+    await saveLoginCredentials(username, password);
+    applyLoginFormState(true);
+    $("#footer-status").textContent = "提交成功";
+  });
+
+  $("#btn-clear-login").addEventListener("click", async () => {
+    $("#login-username").value = "";
+    $("#login-password").value = "";
+    await saveLoginCredentials("", "");
+    applyLoginFormState(false);
+    $("#footer-status").textContent = "已清空，可重新输入账号密码";
+  });
+
   // Log panel
   $("#log-toggle").addEventListener("click", () => {
     $("#log-panel").hidden = !$("#log-panel").hidden;
@@ -1569,6 +2121,9 @@ async function init() {
   await loadSettings();
   $("#toggle-webvpn").checked = settings.useWebVPN;
   $("#toggle-levels").checked = settings.fetchLevels;
+  $("#login-username").value = settings.loginUsername || "";
+  $("#login-password").value = settings.loginPassword || "";
+  applyLoginFormState(!!(settings.loginUsername && settings.loginPassword));
   bindEvents();
   renderList();
   if (papers.length > 0) {

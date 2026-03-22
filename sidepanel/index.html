@@ -48,6 +48,32 @@
 
       <!-- Feature: Download -->
       <div class="feature" id="feature-download">
+        <div class="login-config" id="login-config">
+          <div class="login-config-title">自动登录账号</div>
+          <div class="login-config-row">
+            <input
+              type="text"
+              id="login-username"
+              class="login-input"
+              placeholder="用户名/手机号"
+              autocomplete="username"
+            />
+            <input
+              type="password"
+              id="login-password"
+              class="login-input"
+              placeholder="密码"
+              autocomplete="current-password"
+            />
+            <button class="btn btn-primary btn-sm" id="btn-save-login">
+              提交
+            </button>
+            <button class="btn btn-ghost btn-sm" id="btn-clear-login" disabled>
+              清空
+            </button>
+          </div>
+        </div>
+
         <!-- Controls -->
         <div class="controls">
           <div class="controls-btns">

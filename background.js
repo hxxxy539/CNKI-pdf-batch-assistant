@@ -42,6 +42,15 @@ function normalizeYear(year) {
   return m ? m[0] : "";
 }
 
+function extractOrderId(url) {
+  try {
+    const u = new URL(String(url || ""));
+    return u.searchParams.get("id") || "";
+  } catch {
+    return "";
+  }
+}
+
 function normalizePathSegment(segment, fallback) {
   const cleaned = String(segment || "")
     .replace(/[\\/:*?"<>|]/g, "_")
@@ -60,14 +69,24 @@ function registerDownloadMeta({ url, year, journal, aliases }) {
   if (uniqKeys.length === 0 || !y)
     return { ok: false, error: "invalid_params" };
 
+  const orderIds = Array.from(
+    new Set(uniqKeys.map(extractOrderId).filter(Boolean)),
+  );
+
   const meta = {
     year: y,
     journal: normalizePathSegment(journal, "unknown_journal"),
-    expiresAt: Date.now() + 10 * 60 * 1000,
+    orderIds,
+    expiresAt: Date.now() + 30 * 60 * 1000,
+    hitCount: 0,
   };
 
   uniqKeys.forEach((k) => pendingDownloadMetaMap.set(k, meta));
-  return { ok: true, registeredKeys: uniqKeys.length };
+  return {
+    ok: true,
+    registeredKeys: uniqKeys.length,
+    registeredOrderIds: orderIds.length,
+  };
 }
 
 function findDownloadMeta(item) {
@@ -76,25 +95,47 @@ function findDownloadMeta(item) {
     if (v.expiresAt <= now) pendingDownloadMetaMap.delete(k);
   }
 
+  const consumeMeta = (meta) => {
+    if (!meta) return null;
+    meta.hitCount = (meta.hitCount || 0) + 1;
+    if (meta.hitCount >= 3) {
+      for (const [k, v] of pendingDownloadMetaMap.entries()) {
+        if (v === meta) pendingDownloadMetaMap.delete(k);
+      }
+    }
+    return meta;
+  };
+
   const candidates = [
     normalizeUrl(item?.finalUrl),
     normalizeUrl(item?.url),
     normalizeUrl(item?.referrer),
   ].filter(Boolean);
 
+  const candidateOrderIds = Array.from(
+    new Set(candidates.map(extractOrderId).filter(Boolean)),
+  );
+
+  if (candidateOrderIds.length > 0) {
+    for (const [, v] of pendingDownloadMetaMap.entries()) {
+      if (!Array.isArray(v?.orderIds) || v.orderIds.length === 0) continue;
+      if (v.orderIds.some((id) => candidateOrderIds.includes(id))) {
+        return consumeMeta(v);
+      }
+    }
+  }
+
   for (const c of candidates) {
     const hit = pendingDownloadMetaMap.get(c);
     if (hit?.year) {
-      pendingDownloadMetaMap.delete(c);
-      return hit;
+      return consumeMeta(hit);
     }
   }
 
   for (const c of candidates) {
     for (const [k, v] of pendingDownloadMetaMap.entries()) {
       if (c.includes(k) || k.includes(c)) {
-        pendingDownloadMetaMap.delete(k);
-        return v;
+        return consumeMeta(v);
       }
     }
   }
